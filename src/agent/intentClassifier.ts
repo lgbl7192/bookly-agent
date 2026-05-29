@@ -18,6 +18,7 @@ const VALID_INTENTS = new Set<Intent>([
   'ambiguous_order_help',
   'policy_question',
   'account_help',
+  'courtesy',
   'unknown',
 ])
 
@@ -31,6 +32,7 @@ export const deterministicClassifier: IntentClassifier = ({ message, previousInt
 function detectIntent(message: string, previousIntent: Intent): ClassifierResult {
   const text = message.toLowerCase()
 
+  if (isCourtesyMessage(text)) return { intent: 'courtesy', confidence: 0.99 }
   if (isUnsupportedRequest(text)) return { intent: 'unknown', confidence: 0.44 }
   if (text.includes('policy') || /\breturn window\b/.test(text)) return { intent: 'policy_question', confidence: 0.9 }
   if (/\b(return|refund|send back|exchange)\b/.test(text)) return { intent: 'return_request', confidence: 0.92 }
@@ -41,6 +43,12 @@ function detectIntent(message: string, previousIntent: Intent): ClassifierResult
   if (previousIntent !== 'unknown' && hasWorkflowSignal(message)) return { intent: previousIntent, confidence: 0.72 }
 
   return { intent: 'unknown', confidence: 0.35 }
+}
+
+export function isCourtesyMessage(message: string) {
+  return /^(?:thanks|thank you|thank you very much|thanks a lot|much appreciated)[!.,\s]*$/i.test(
+    message.trim(),
+  )
 }
 
 function isUnsupportedRequest(text: string) {

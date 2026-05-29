@@ -157,9 +157,11 @@ const cases: EvalCase[] = [
     turns: ['I want to return I-11 from B1001, it was damaged'],
     assert: ([turn]) =>
       turn.trace.decision === 'decline_and_offer_escalation' &&
-      turn.response.toLowerCase().includes('delivery')
+      turn.response.toLowerCase().includes('still in transit') &&
+      turn.response.toLowerCase().includes('anything else i can help with') &&
+      !turn.response.toLowerCase().includes('the agent should')
         ? undefined
-        : 'Expected return to be blocked because the order has not been delivered yet.',
+        : 'Expected a customer-facing in-transit explanation without internal agent guidance.',
   },
   {
     name: 'return: blocked when outside 30-day return window',
@@ -267,6 +269,88 @@ const cases: EvalCase[] = [
       )
         return 'Expected third turn to resolve with grounded order data after corrected ID.'
       return undefined
+    },
+  },
+
+  // --- Return context switching ---
+
+  {
+    name: 'return: named item follow-up switches away from a prior final-sale item',
+    turns: [
+      'I want to return I-22 from B1002 because I changed my mind',
+      'Ok what about Applications?',
+    ],
+    assert: (turns) => {
+      const followUp = turns.at(-1)
+      return followUp?.trace.decision === 'ask_clarifying_question' &&
+        followUp.trace.missingSlots.includes('returnReason') &&
+        followUp.state.slots.itemId === 'I-21' &&
+        followUp.state.slots.returnReason === undefined
+        ? undefined
+        : 'Expected Applications follow-up to switch to I-21 and collect a fresh return reason.'
+    },
+  },
+  {
+    name: 'return: another order request clears the previous return context',
+    turns: [
+      'I want to return I-22 from B1002 because I changed my mind',
+      'Ok I need to return another order',
+    ],
+    assert: (turns) => {
+      const followUp = turns.at(-1)
+      return followUp?.trace.decision === 'ask_clarifying_question' &&
+        followUp.trace.missingSlots.includes('orderId') &&
+        followUp.state.slots.orderId === undefined &&
+        followUp.state.slots.itemId === undefined &&
+        followUp.state.slots.returnReason === undefined
+        ? undefined
+        : 'Expected another-order request to collect a fresh order ID without stale return slots.'
+    },
+  },
+  {
+    name: 'return: single-item order does not ask customer to select the only item',
+    turns: ['I want to return something from B1001'],
+    assert: ([turn]) =>
+      turn.trace.decision === 'decline_and_offer_escalation' &&
+      turn.state.slots.itemId === 'I-11' &&
+      turn.response.toLowerCase().includes('still in transit') &&
+      !turn.response.toLowerCase().includes('the agent should')
+        ? undefined
+        : 'Expected the only item in B1001 to be selected automatically before eligibility checks.',
+  },
+  {
+    name: 'conversation: thanks after completed return gets a friendly acknowledgement',
+    turns: [
+      'I want to return I-21 from B1002',
+      'Changed my mind.',
+      'Thanks!',
+    ],
+    assert: (turns) => {
+      const thanks = turns.at(-1)
+      return thanks?.trace.intent === 'courtesy' &&
+        thanks.trace.decision === 'answer_conversationally' &&
+        thanks.trace.toolCalls.length === 0 &&
+        thanks.response.includes("You're welcome")
+        ? undefined
+        : 'Expected thanks to receive a tool-free conversational acknowledgement.'
+    },
+  },
+  {
+    name: 'return: active session resumes after an unrelated interruption',
+    turns: [
+      'I want to return I-21 from B1002',
+      "What's the weather?",
+      'damaged',
+    ],
+    assert: (turns) => {
+      const [, interruption, resumed] = turns
+      return interruption.trace.decision === 'unsupported_request' &&
+        interruption.trace.toolCalls.length === 0 &&
+        interruption.state.returnSession?.phase === 'collect_reason' &&
+        resumed.trace.responseCode === 'RETURN_CREATED' &&
+        resumed.state.returnSession?.phase === 'complete'
+        ? undefined
+        : 'Expected an active return to resume after an unrelated tool-free interruption.'
     },
   },
 ]

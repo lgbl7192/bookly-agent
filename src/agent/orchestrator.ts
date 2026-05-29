@@ -6,6 +6,7 @@ import {
 } from '../tools/booklyTools'
 import {
   deterministicClassifier,
+  isCourtesyMessage,
   type ClassifierResult,
   type IntentClassifier,
 } from './intentClassifier'
@@ -18,6 +19,8 @@ import type {
   AgentState,
   AgentTurn,
   Decision,
+  ResponseCode,
+  ReturnSession,
   SlotKey,
   Slots,
   ToolCall,
@@ -31,7 +34,7 @@ const initialState: AgentState = {
 }
 
 export function createInitialState(): AgentState {
-  return { ...initialState, slots: {}, toolCalls: [] }
+  return { ...initialState, slots: {}, toolCalls: [], returnSession: undefined }
 }
 
 export function runAgentTurn(
@@ -67,52 +70,81 @@ function buildAgentTurn(
 ): AgentTurn | Promise<AgentTurn> {
   const newSlots = extractSlots(userMessage)
 
-  // Preserve the prior workflow intent when:
-  // (a) detection is uncertain/unknown — the user is likely answering a slot question,
-  //     not switching topics. Low confidence alone should not erase conversation context.
-  // (b) the message contributed a workflow slot (order ID, item ID, return reason),
-  //     meaning the user is clearly continuing the current flow.
-  // The prior intent is only replaced when the classifier is confident about a NEW,
-  // explicit intent (e.g. the customer pivots from a return to asking about shipping).
+  // Preserve the prior workflow only when the message supplies a slot or names another item
+  // in the current return order. Unknown messages must not replay a completed workflow.
   const workflowSlotKeys: SlotKey[] = ['orderId', 'itemId', 'returnReason']
-  const advancesWorkflow =
-    previousState.intent !== 'unknown' &&
-    workflowSlotKeys.some((k) => newSlots[k] !== undefined)
-  const effectiveIntent =
-    (detected.confidence < 0.5 || detected.intent === 'unknown' || advancesWorkflow) &&
+  const returnSessionIsActive = isActiveReturnSession(previousState.returnSession)
+  const continuationIntent =
     previousState.intent !== 'unknown'
       ? previousState.intent
-      : detected.intent
-  const slots = mergeSlots(previousState, newSlots, effectiveIntent)
-
+      : returnSessionIsActive
+        ? 'return_request'
+        : 'unknown'
+  const advancesWorkflow =
+    continuationIntent !== 'unknown' &&
+    workflowSlotKeys.some((k) => newSlots[k] !== undefined)
+  const currentReturnItem = findCurrentReturnItem(userMessage, previousState)
+  const continuesCurrentReturn =
+    (previousState.intent === 'return_request' || returnSessionIsActive) &&
+    Boolean(currentReturnItem)
+  const effectiveIntent = isCourtesyMessage(userMessage)
+    ? 'courtesy'
+    : detected.intent === 'unknown' &&
+    continuationIntent !== 'unknown' &&
+    (advancesWorkflow || continuesCurrentReturn)
+      ? continuationIntent
+      : detected.confidence < 0.5
+        ? 'unknown'
+        : detected.intent
   const state: AgentState = {
     intent: effectiveIntent,
-    slots,
+    slots: mergeGeneralSlots(previousState, newSlots, effectiveIntent),
+    returnSession: previousState.returnSession
+      ? { ...previousState.returnSession }
+      : undefined,
     toolCalls: [],
+  }
+  if (effectiveIntent === 'return_request') {
+    state.returnSession = prepareReturnSession(
+      userMessage,
+      previousState,
+      newSlots,
+      detected,
+      Boolean(currentReturnItem),
+    )
+    syncReturnSlots(state)
   }
 
   let response: string
   let decision: Decision
+  let responseCode: ResponseCode | undefined
   let rationale: string
   let missingSlots: SlotKey[] = []
 
-  if (effectiveIntent === 'ambiguous_order_help') {
+  if (effectiveIntent === 'courtesy') {
+    response = "You're welcome! Is there anything else I can help with?"
+    decision = 'answer_conversationally'
+    rationale = 'The customer expressed thanks, so the agent acknowledges it without using tools.'
+  } else if (effectiveIntent === 'ambiguous_order_help') {
     const result = handleAmbiguousOrderHelp()
     response = result.response
     decision = result.decision
     rationale = result.rationale
+    responseCode = result.responseCode
     missingSlots = result.missingSlots
   } else if (effectiveIntent === 'order_status') {
     const result = handleOrderStatus(userMessage, state)
     response = result.response
     decision = result.decision
     rationale = result.rationale
+    responseCode = result.responseCode
     missingSlots = result.missingSlots
   } else if (effectiveIntent === 'return_request') {
     const result = handleReturnRequest(userMessage, state)
     response = result.response
     decision = result.decision
     rationale = result.rationale
+    responseCode = result.responseCode
     missingSlots = result.missingSlots
   } else if (effectiveIntent === 'account_help') {
     // Bug 9 fix: account_help defaults to 'password reset', not 'shipping'.
@@ -120,12 +152,14 @@ function buildAgentTurn(
     response = result.response
     decision = result.decision
     rationale = result.rationale
+    responseCode = result.responseCode
     missingSlots = result.missingSlots
   } else if (effectiveIntent === 'policy_question') {
     const result = handlePolicyQuestion(userMessage, state, 'shipping')
     response = result.response
     decision = result.decision
     rationale = result.rationale
+    responseCode = result.responseCode
     missingSlots = result.missingSlots
   } else if (detected.confidence < 0.5) {
     const result = handleLowConfidence()
@@ -144,9 +178,11 @@ function buildAgentTurn(
     intent: effectiveIntent,
     confidence: detected.confidence,
     slots: state.slots,
+    returnSession: state.returnSession,
     missingSlots,
     toolCalls: state.toolCalls,
     decision,
+    responseCode,
     rationale,
   }
   const polisherInput: PolisherInput = {
@@ -181,7 +217,11 @@ function buildAgentTurn(
   }
 }
 
-function mergeSlots(previousState: AgentState, newSlots: Slots, effectiveIntent: AgentState['intent']) {
+function mergeGeneralSlots(
+  previousState: AgentState,
+  newSlots: Slots,
+  effectiveIntent: AgentState['intent'],
+) {
   const slots: Slots = {
     ...previousState.slots,
     ...newSlots,
@@ -196,11 +236,6 @@ function mergeSlots(previousState: AgentState, newSlots: Slots, effectiveIntent:
   }
 
   if (effectiveIntent !== previousState.intent) {
-    if (effectiveIntent === 'return_request') {
-      if (!newSlots.itemId) delete slots.itemId
-      if (!newSlots.returnReason) delete slots.returnReason
-    }
-
     if (effectiveIntent === 'policy_question' && !newSlots.policyTopic) {
       delete slots.policyTopic
     }
@@ -211,6 +246,86 @@ function mergeSlots(previousState: AgentState, newSlots: Slots, effectiveIntent:
   }
 
   return slots
+}
+
+function prepareReturnSession(
+  userMessage: string,
+  previousState: AgentState,
+  newSlots: Slots,
+  detected: ClassifierResult,
+  matchesCurrentItem: boolean,
+): ReturnSession {
+  const previousSession = previousState.returnSession
+  const startsAnotherOrder = /\b(?:another|different|new)\s+order\b/i.test(userMessage)
+  const startsAnotherItem = /\b(?:another|different|new)\s+(?:item|book|return)\b/i.test(userMessage)
+  const terminalSession =
+    previousSession?.phase === 'complete' || previousSession?.phase === 'declined'
+  const restartsTerminalSession =
+    terminalSession &&
+    detected.intent === 'return_request' &&
+    !matchesCurrentItem &&
+    !newSlots.orderId &&
+    !newSlots.itemId &&
+    !newSlots.returnReason
+  const startsFresh =
+    !previousSession ||
+    (previousState.intent !== 'return_request' && !isActiveReturnSession(previousSession)) ||
+    startsAnotherOrder ||
+    restartsTerminalSession
+  const session: ReturnSession = startsFresh
+    ? { phase: 'collect_order' }
+    : { ...previousSession }
+
+  if (startsAnotherItem) {
+    delete session.itemId
+    delete session.reason
+    session.phase = session.orderId ? 'collect_item' : 'collect_order'
+  }
+
+  if (newSlots.orderId && newSlots.orderId !== session.orderId) {
+    session.orderId = newSlots.orderId
+    session.email = newSlots.email
+    delete session.itemId
+    delete session.reason
+    session.phase = 'collect_item'
+  } else if (newSlots.email) {
+    session.email = newSlots.email
+  }
+
+  if (newSlots.itemId && newSlots.itemId !== session.itemId) {
+    session.itemId = newSlots.itemId
+    delete session.reason
+    session.phase = 'collect_reason'
+  }
+
+  if (newSlots.returnReason) {
+    session.reason = newSlots.returnReason
+  }
+
+  return session
+}
+
+function isActiveReturnSession(session: ReturnSession | undefined) {
+  return (
+    session?.phase === 'collect_order' ||
+    session?.phase === 'collect_item' ||
+    session?.phase === 'collect_reason'
+  )
+}
+
+function syncReturnSlots(state: AgentState) {
+  delete state.slots.orderId
+  delete state.slots.email
+  delete state.slots.itemId
+  delete state.slots.returnReason
+
+  const session = state.returnSession
+  if (!session) return
+
+  if (session.orderId) state.slots.orderId = session.orderId
+  if (session.email) state.slots.email = session.email
+  if (session.itemId) state.slots.itemId = session.itemId
+  if (session.reason) state.slots.returnReason = session.reason
 }
 
 function extractSlots(message: string): Slots {
@@ -308,126 +423,200 @@ function handleLowConfidence(): TurnParts {
 }
 
 function handleReturnRequest(userMessage: string, state: AgentState): TurnParts {
-  const missingOrderSlots = missingRequiredSlots(state.slots, ['orderId'])
-  if (missingOrderSlots.length > 0) {
+  const session = state.returnSession ?? { phase: 'collect_order' }
+  state.returnSession = session
+
+  if (!session.orderId) {
+    session.phase = 'collect_order'
     const nearMiss = detectNearMissOrderId(userMessage)
-    return {
-      response: nearMiss
-        ? `I couldn't recognise "${nearMiss}" as a Bookly order ID — they're exactly 4 digits, for example B1002. Could you double-check?`
-        : 'I can help start a return. First, what is the Bookly order ID? It should look like B1002.',
+    return buildReturnTurn(state, 'ASK_RETURN_ORDER_ID', { nearMiss }, {
       decision: 'ask_clarifying_question',
       rationale: nearMiss
         ? 'The provided string resembles an order ID but has the wrong format; the agent corrects it before retrying the tool.'
         : 'The agent needs an order before it can inspect items or eligibility.',
-      missingSlots: missingOrderSlots,
-    }
+      missingSlots: ['orderId'],
+    })
   }
 
   const orderResult = lookupOrder({
-    orderId: state.slots.orderId,
-    email: state.slots.email,
+    orderId: session.orderId,
+    email: session.email,
   })
   recordToolCall(
     state,
     'lookupOrder',
-    { orderId: state.slots.orderId, email: state.slots.email },
+    { orderId: session.orderId, email: session.email },
     orderResult,
   )
 
   if (!orderResult.ok) {
-    return {
-      response:
-        "I couldn't find that order, so I should not create a return. Please verify the order ID or I can route this to a support specialist.",
+    session.phase = 'collect_order'
+    return buildReturnTurn(state, 'RETURN_ORDER_NOT_FOUND', {}, {
       decision: 'route_to_human',
       rationale: 'Return creation is blocked because the order lookup tool failed.',
       missingSlots: [],
-    }
+    })
   }
 
-  if (!state.slots.itemId) {
-    const matched = fuzzyMatchItem(userMessage, orderResult.data.items)
+  const matched = fuzzyMatchItem(userMessage, orderResult.data.items)
+  if (matched && matched.id !== session.itemId) {
+    const replacesSelectedItem = session.itemId !== undefined
+    session.itemId = matched.id
+    if (replacesSelectedItem) delete session.reason
+  }
+
+  if (!session.itemId) {
     if (matched) {
-      state.slots.itemId = matched.id
+      session.itemId = matched.id
+    } else if (orderResult.data.items.length === 1) {
+      session.itemId = orderResult.data.items[0].id
     } else {
       const itemList = orderResult.data.items.map((item) => `${item.id}: ${item.title}`).join('; ')
-      return {
-        response: `Which item do you want to return? I found ${itemList}.`,
+      session.phase = 'collect_item'
+      return buildReturnTurn(state, 'ASK_RETURN_ITEM', { itemList }, {
         decision: 'ask_clarifying_question',
         rationale:
           'The order contains item-level return decisions, so the agent asks before checking eligibility.',
         missingSlots: ['itemId'],
-      }
+      })
     }
   }
 
-  // orderId and itemId are guaranteed set by the guards above.
-  const orderId = state.slots.orderId!
-  const itemId = state.slots.itemId!
-
-  // Bug 2 fix: removed the unreachable `if (!orderId || !itemId)` guard that followed here.
+  const orderId = session.orderId
+  const itemId = session.itemId
 
   const eligibility = checkReturnEligibility({ orderId, itemId })
   recordToolCall(state, 'checkReturnEligibility', { orderId, itemId }, eligibility)
 
   if (!eligibility.ok) {
-    return {
-      response: `${eligibility.error} I can route this to a support specialist if you think the order details are wrong.`,
+    session.phase = 'collect_item'
+    return buildReturnTurn(state, 'RETURN_ITEM_NOT_FOUND', { error: eligibility.error }, {
       decision: 'route_to_human',
       rationale: 'The eligibility tool could not verify a safe automated return path.',
       missingSlots: [],
-    }
+    })
   }
 
   if (!eligibility.data.eligible) {
-    return {
-      response: `${eligibility.data.reason} I cannot create this return automatically, but I can escalate it for manual review.`,
+    session.phase = 'declined'
+    return buildReturnTurn(
+      state,
+      eligibility.data.reasonCode === 'not_delivered'
+        ? 'RETURN_NOT_DELIVERED'
+        : eligibility.data.reasonCode === 'final_sale'
+          ? 'RETURN_FINAL_SALE'
+          : eligibility.data.reasonCode === 'outside_window'
+            ? 'RETURN_OUTSIDE_WINDOW'
+            : 'RETURN_INELIGIBLE',
+      { reason: eligibility.data.reason },
+      {
       decision: 'decline_and_offer_escalation',
       rationale: 'The agent follows policy rather than overriding return eligibility.',
       missingSlots: [],
-    }
+      },
+    )
   }
 
-  if (!state.slots.returnReason) {
-    return {
-      response:
-        'This item is eligible for return. What is the return reason: damaged, wrong item, or changed my mind?',
+  if (!session.reason) {
+    session.phase = 'collect_reason'
+    return buildReturnTurn(state, 'ASK_RETURN_REASON', {}, {
       decision: 'ask_clarifying_question',
       rationale: 'The return tool requires a reason before creating the request.',
       missingSlots: ['returnReason'],
-    }
+    })
   }
 
   const returnRequest = createReturnRequest({
     orderId,
     itemId,
-    reason: state.slots.returnReason,
+    reason: session.reason,
   })
   recordToolCall(
     state,
     'createReturnRequest',
     {
-      orderId: state.slots.orderId,
-      itemId: state.slots.itemId,
-      reason: state.slots.returnReason,
+      orderId,
+      itemId,
+      reason: session.reason,
     },
     returnRequest,
   )
 
   if (!returnRequest.ok) {
-    return {
-      response: `${returnRequest.error} I can escalate this for manual review.`,
+    session.phase = 'declined'
+    return buildReturnTurn(state, 'RETURN_CREATE_REJECTED', {}, {
       decision: 'decline_and_offer_escalation',
       rationale: 'The create-return tool rejected the request.',
       missingSlots: [],
-    }
+    })
   }
 
-  return {
-    response: `Done. I created return ${returnRequest.data.returnId}. ${returnRequest.data.labelStatus}`,
+  session.phase = 'complete'
+  return buildReturnTurn(state, 'RETURN_CREATED', returnRequest.data, {
     decision: 'create_return',
     rationale: 'The agent only created the return after order lookup and eligibility checks succeeded.',
     missingSlots: [],
+  })
+}
+
+function buildReturnTurn(
+  state: AgentState,
+  responseCode: ResponseCode,
+  context: ReturnResponseContext,
+  parts: Omit<TurnParts, 'response' | 'responseCode'>,
+): TurnParts {
+  syncReturnSlots(state)
+  return {
+    ...parts,
+    responseCode,
+    response: renderReturnResponse(responseCode, context),
   }
+}
+
+function renderReturnResponse(responseCode: ResponseCode, context: ReturnResponseContext) {
+  if (responseCode === 'ASK_RETURN_ORDER_ID') {
+    return context.nearMiss
+      ? `I couldn't recognise "${context.nearMiss}" as a Bookly order ID — they're exactly 4 digits, for example B1002. Could you double-check?`
+      : 'I can help start a return. First, what is the Bookly order ID? It should look like B1002.'
+  }
+
+  if (responseCode === 'RETURN_ORDER_NOT_FOUND') {
+    return "I couldn't find that order, so I cannot create a return. Please verify the order ID or I can route this to a support specialist."
+  }
+
+  if (responseCode === 'ASK_RETURN_ITEM') {
+    return `Which item do you want to return? I found ${context.itemList}.`
+  }
+
+  if (responseCode === 'RETURN_ITEM_NOT_FOUND') {
+    return `${context.error} I can route this to a support specialist if you think the order details are wrong.`
+  }
+
+  if (responseCode === 'RETURN_NOT_DELIVERED') {
+    return 'This item is still in transit, so I cannot process a return until it has been delivered. Is there anything else I can help with?'
+  }
+
+  if (responseCode === 'RETURN_FINAL_SALE') {
+    return 'This item is marked final sale, so it is not eligible for return. Is there anything else I can help with?'
+  }
+
+  if (responseCode === 'RETURN_OUTSIDE_WINDOW') {
+    return 'This order was delivered more than 30 days ago, so it is outside the return window. Is there anything else I can help with?'
+  }
+
+  if (responseCode === 'RETURN_INELIGIBLE') {
+    return `${context.reason} Is there anything else I can help with?`
+  }
+
+  if (responseCode === 'ASK_RETURN_REASON') {
+    return 'This item is eligible for return. What is the return reason: damaged, wrong item, or changed my mind?'
+  }
+
+  if (responseCode === 'RETURN_CREATE_REJECTED') {
+    return 'I could not create this return automatically. I can escalate it for manual review.'
+  }
+
+  return `Done. I created return ${context.returnId}. ${context.labelStatus}`
 }
 
 // Bug 9 fix: `defaultTopic` lets account_help pass 'password reset' so an intent like
@@ -489,6 +678,16 @@ function fuzzyMatchItem(
   })
 }
 
+function findCurrentReturnItem(message: string, state: AgentState) {
+  if (!state.returnSession?.orderId) return undefined
+
+  const orderResult = lookupOrder({
+    orderId: state.returnSession.orderId,
+    email: state.returnSession.email,
+  })
+  return orderResult.ok ? fuzzyMatchItem(message, orderResult.data.items) : undefined
+}
+
 // Returns the raw token (e.g. "B10002") if the message contains something that looks like a
 // Bookly order ID but has the wrong number of digits, so handlers can surface a format hint
 // instead of a generic "please provide your order ID" prompt.
@@ -504,4 +703,14 @@ type TurnParts = {
   decision: Decision
   rationale: string
   missingSlots: SlotKey[]
+  responseCode?: ResponseCode
+}
+
+type ReturnResponseContext = {
+  nearMiss?: string
+  itemList?: string
+  error?: string
+  reason?: string
+  returnId?: string
+  labelStatus?: string
 }
