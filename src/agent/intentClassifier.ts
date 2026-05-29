@@ -59,9 +59,12 @@ function isAmbiguousOrderHelp(text: string) {
 
 // Bug 10 fix: removed `/@/.test(message)` — an email address is too weak a signal for
 // intent continuity and caused false positives (e.g. "email me at X" inheriting prior intent).
+// Near-miss fix: broadened the B-prefix pattern from \d{4} to \d{3,6} so that a typo like
+// "B10002" still counts as a workflow signal and preserves the prior intent instead of
+// abandoning the conversation and asking "what would you like to do?".
 function hasWorkflowSignal(message: string) {
   return (
-    /\bB\d{4}\b/i.test(message) ||
+    /\bB\d{3,6}\b/i.test(message) ||
     /\bI-\d{2}\b/i.test(message) ||
     /\b(damaged|wrong|changed my mind)\b/i.test(message)
   )

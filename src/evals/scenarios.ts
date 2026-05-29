@@ -228,6 +228,47 @@ const cases: EvalCase[] = [
         ? undefined
         : 'Expected off-topic request to be handled gracefully with no tool use.',
   },
+
+  // --- Near-miss order ID handling ---
+
+  {
+    name: 'near-miss order ID: order status gives format hint instead of generic prompt',
+    turns: ['Where is B10002?'],
+    assert: ([turn]) =>
+      turn.trace.decision === 'ask_clarifying_question' &&
+      turn.trace.missingSlots.includes('orderId') &&
+      turn.response.includes('B10002') &&
+      turn.response.toLowerCase().includes('4 digits')
+        ? undefined
+        : 'Expected a format-correction hint mentioning the bad ID and the 4-digit rule.',
+  },
+  {
+    name: 'near-miss order ID: return workflow gives format hint instead of generic prompt',
+    turns: ['I need to return something from B10002'],
+    assert: ([turn]) =>
+      turn.trace.decision === 'ask_clarifying_question' &&
+      turn.trace.missingSlots.includes('orderId') &&
+      turn.response.includes('B10002') &&
+      turn.response.toLowerCase().includes('4 digits')
+        ? undefined
+        : 'Expected a format-correction hint mentioning the bad ID and the 4-digit rule.',
+  },
+  {
+    name: 'near-miss order ID: corrected ID on follow-up completes the order status lookup',
+    turns: ['Track my package', 'B10002', 'B1001'],
+    assert: (turns) => {
+      const [, hint, resolved] = turns
+      if (!hint.response.includes('B10002') || !hint.response.toLowerCase().includes('4 digits'))
+        return 'Expected second turn to give a format hint for B10002.'
+      if (
+        resolved.trace.decision !== 'answer_with_grounded_data' ||
+        !resolved.trace.toolCalls.some((c) => c.name === 'lookupOrder') ||
+        !resolved.response.includes('1Z-BOOKLY-1001')
+      )
+        return 'Expected third turn to resolve with grounded order data after corrected ID.'
+      return undefined
+    },
+  },
 ]
 
 const friendlyTestPolisher: ResponsePolisher = ({ draftResponse }) => ({

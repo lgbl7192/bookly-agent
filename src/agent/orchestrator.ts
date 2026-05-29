@@ -67,18 +67,22 @@ function buildAgentTurn(
 ): AgentTurn | Promise<AgentTurn> {
   const newSlots = extractSlots(userMessage)
 
-  // Preserve the prior workflow intent when a confident classification supplies a workflow
-  // slot, meaning the user is answering a question rather than starting a new intent.
+  // Preserve the prior workflow intent when:
+  // (a) detection is uncertain/unknown — the user is likely answering a slot question,
+  //     not switching topics. Low confidence alone should not erase conversation context.
+  // (b) the message contributed a workflow slot (order ID, item ID, return reason),
+  //     meaning the user is clearly continuing the current flow.
+  // The prior intent is only replaced when the classifier is confident about a NEW,
+  // explicit intent (e.g. the customer pivots from a return to asking about shipping).
   const workflowSlotKeys: SlotKey[] = ['orderId', 'itemId', 'returnReason']
   const advancesWorkflow =
     previousState.intent !== 'unknown' &&
     workflowSlotKeys.some((k) => newSlots[k] !== undefined)
   const effectiveIntent =
-    detected.confidence < 0.5
-      ? 'unknown'
-      : detected.intent === 'unknown' && advancesWorkflow
-        ? previousState.intent
-        : detected.intent
+    (detected.confidence < 0.5 || detected.intent === 'unknown' || advancesWorkflow) &&
+    previousState.intent !== 'unknown'
+      ? previousState.intent
+      : detected.intent
   const slots = mergeSlots(previousState, newSlots, effectiveIntent)
 
   const state: AgentState = {
@@ -99,7 +103,7 @@ function buildAgentTurn(
     rationale = result.rationale
     missingSlots = result.missingSlots
   } else if (effectiveIntent === 'order_status') {
-    const result = handleOrderStatus(state)
+    const result = handleOrderStatus(userMessage, state)
     response = result.response
     decision = result.decision
     rationale = result.rationale
@@ -231,14 +235,18 @@ function extractSlots(message: string): Slots {
   return slots
 }
 
-function handleOrderStatus(state: AgentState): TurnParts {
+function handleOrderStatus(userMessage: string, state: AgentState): TurnParts {
   const missing = missingRequiredSlots(state.slots, ['orderId'])
   if (missing.length > 0) {
+    const nearMiss = detectNearMissOrderId(userMessage)
     return {
-      response: 'I can check that. What is the Bookly order ID? It should look like B1001.',
+      response: nearMiss
+        ? `I couldn't recognise "${nearMiss}" as a Bookly order ID — they're exactly 4 digits, for example B1001. Could you double-check?`
+        : 'I can check that. What is the Bookly order ID? It should look like B1001.',
       decision: 'ask_clarifying_question',
-      rationale:
-        'Order status needs a customer-specific identifier before the agent can use the order lookup tool.',
+      rationale: nearMiss
+        ? 'The provided string resembles an order ID but has the wrong format; the agent corrects it before retrying the tool.'
+        : 'Order status needs a customer-specific identifier before the agent can use the order lookup tool.',
       missingSlots: missing,
     }
   }
@@ -302,10 +310,15 @@ function handleLowConfidence(): TurnParts {
 function handleReturnRequest(userMessage: string, state: AgentState): TurnParts {
   const missingOrderSlots = missingRequiredSlots(state.slots, ['orderId'])
   if (missingOrderSlots.length > 0) {
+    const nearMiss = detectNearMissOrderId(userMessage)
     return {
-      response: 'I can help start a return. First, what is the Bookly order ID? It should look like B1002.',
+      response: nearMiss
+        ? `I couldn't recognise "${nearMiss}" as a Bookly order ID — they're exactly 4 digits, for example B1002. Could you double-check?`
+        : 'I can help start a return. First, what is the Bookly order ID? It should look like B1002.',
       decision: 'ask_clarifying_question',
-      rationale: 'The agent needs an order before it can inspect items or eligibility.',
+      rationale: nearMiss
+        ? 'The provided string resembles an order ID but has the wrong format; the agent corrects it before retrying the tool.'
+        : 'The agent needs an order before it can inspect items or eligibility.',
       missingSlots: missingOrderSlots,
     }
   }
@@ -474,6 +487,16 @@ function fuzzyMatchItem(
       .filter((w) => w.length > 3 && !stopwords.has(w))
     return words.some((word) => lower.includes(word))
   })
+}
+
+// Returns the raw token (e.g. "B10002") if the message contains something that looks like a
+// Bookly order ID but has the wrong number of digits, so handlers can surface a format hint
+// instead of a generic "please provide your order ID" prompt.
+function detectNearMissOrderId(message: string): string | undefined {
+  const match = message.match(/\bB\d{3,6}\b/i)?.[0].toUpperCase()
+  if (!match) return undefined
+  // Exact 4-digit IDs are valid and would already be in slots — only flag the mismatches.
+  return /^B\d{4}$/.test(match) ? undefined : match
 }
 
 type TurnParts = {
